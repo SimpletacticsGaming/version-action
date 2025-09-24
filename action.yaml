@@ -1,0 +1,106 @@
+name: 'Version generator'
+description: |
+  Generates a version string.
+  • On the main (or any protected) branch it returns the user provided input
+  • On a pull-request pipeline it returns 0.<PR>#.<RUN_ID>
+author: 'mohjohfox <marcofuchs@mohjohfox.de>'
+
+inputs:
+  version:
+    description: "Optional version input to use when no PR is open (e.g. 1.2.3)."
+    required: false
+  protected_branches:
+    description: "Comma-separated list of branches where a manual version is allowed. Defaults to 'main,master'."
+    required: false
+    default: "main,master"
+
+outputs:
+  version:
+    description: "The computed version string (either the user input or the auto-generated PR version)."
+    value: ${{ steps.version.outputs.version }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect context
+      id: ctx
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+        event="${GITHUB_EVENT_NAME}"
+        pr_open="false"
+        pr_number="$(gh pr list --limit 1 --head "$branch" --state open --json number --jq '.[0].number')"
+
+        if [[ "$pr_number" ]]; then
+            pr_open="true"
+            echo "Detected pull request #${pr_number} (branch: ${branch})."
+        elif [[ "$event" == pull_request* ]]; then
+          if command -v jq >/dev/null 2>&1; then
+            pr_number="$(jq -r '.pull_request.number // empty' "${GITHUB_EVENT_PATH}")"
+          fi
+
+          if [[ -z "$pr_number" && "$GITHUB_REF" =~ refs/pull/([0-9]+)/ ]]; then
+            pr_number="${BASH_REMATCH[1]}"
+          fi
+
+          if [[ -z "$pr_number" ]]; then
+            echo "Unable to determine pull request number." >&2
+            exit 1
+          fi
+          pr_open="true"
+          echo "Detected pull request #${pr_number} (branch: ${branch})."
+        fi
+        
+        {
+          echo "branch=$branch"
+          echo "event_name=$event"
+          echo "pr_open=$pr_open"
+          echo "pr_number=$pr_number"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Compute version
+      id: version
+      shell: bash
+      env:
+        USER_VERSION: ${{ inputs.version }}
+        PROTECTED_BRANCHES: ${{ inputs.protected_branches }}
+        RUN_ID: ${{ github.run_id }}
+        IS_PR: ${{ steps.ctx.outputs.pr_open }}
+        PR_NUM: ${{ steps.ctx.outputs.pr_number }}
+        BRANCH_NAME: ${{ steps.ctx.outputs.branch }}
+      run: |
+        set -euo pipefail
+
+        IFS=',' read -r -a protected_arr <<< "$PROTECTED_BRANCHES"
+
+        if [[ "$IS_PR" == "true" ]]; then
+          VERSION="0.${PR_NUM}.${RUN_ID}"
+          echo "Running in PR context. Generated version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Non-PR context: require a user-supplied version on allowed branches.
+        allowed="false"
+        for pb in "${protected_arr[@]}"; do
+          pb_trimmed="$(echo -n "$pb" | xargs)"
+          if [[ "$BRANCH_NAME" == "$pb_trimmed" ]]; then
+            allowed="true"
+            break
+          fi
+        done
+
+        if [[ -z "$USER_VERSION" ]]; then
+          echo "ERROR: No open PR detected and no version input provided. Supply 'version' input when running on non-PR events." >&2
+          exit 1
+        fi
+
+        if [[ "$allowed" != "true" ]]; then
+          echo "ERROR: A user-supplied version was provided but branch '$BRANCH_NAME' is not in protected_branches ('$PROTECTED_BRANCHES')." >&2
+          exit 1
+        fi
+
+        echo "Using user-supplied version '$USER_VERSION' on protected branch '$BRANCH_NAME'."
+        echo "version=$USER_VERSION" >> "$GITHUB_OUTPUT"

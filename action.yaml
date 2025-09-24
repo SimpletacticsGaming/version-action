@@ -1,0 +1,88 @@
+name: 'Version generator'
+description: |
+  Generates a version string.
+  • On the main (or any protected) branch it returns the user provided input
+  • On a pull‑request (merge‑request) pipeline it returns 0.<PR>#.<RUN_ID>
+author: 'mohjohfox <marcofuchs@mohjohfox.de>'
+
+inputs:
+  version:
+    description: "Optional version input to use when no PR is open (e.g. 1.2.3)."
+    required: false
+  protected_branches:
+    description: "Comma-separated list of branches where a manual version is allowed. Defaults to 'main,master'."
+    required: false
+    default: "main,master"
+
+outputs:
+  version:
+    description: "The computed version string (either the user input or the auto‑generated PR version)."
+
+runs:
+  using: 'composite'
+  steps:
+#    - name: Detect context
+#      id: ctx
+#      shell: bash
+#      run: |
+#        branch="${GITHUB_REF_NAME}"
+#        echo "Checking for PR on branch: $branch"
+#        pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq '.[0].number' || true)
+#        if [ -n "$pr" ]; then
+#          echo "PR #$pr is open"
+#          echo "pr_open=true" >> $GITHUB_OUTPUT
+#          echo "pr_number=$pr" >> $GITHUB_OUTPUT
+#        else
+#          echo "No open PR found"
+#          echo "pr_open=false" >> $GITHUB_OUTPUT
+#        fi
+
+#    - name: Compute version
+#      id: version
+#      shell: bash
+#      env:
+#        USER_VERSION: ${{ inputs.version }}
+#        PROTECTED_BRANCHES: ${{ inputs.protected_branches }}
+#        RUN_ID: ${{ github.run_id }}
+#        IS_PR: ${{ steps.ctx.outputs.pr_open }}
+#        PR_NUM: ${{ steps.ctx.outputs.pr_number }}
+#      run: |
+#        # normalize protected branches to array
+#        IFS=',' read -r -a protected_arr <<< "$PROTECTED_BRANCHES"
+#        if [[ "${IS_PR}" == "true" ]]; then
+#          echo "Running in a PR context"
+#          VERSION="0.${PR_NUM}.${RUN_ID}"
+#          echo "Generated version: $VERSION"
+#          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+#        else
+#            # No PR open — allow user supplied version only on protected branches (or always if provided)
+#            allowed=false
+#            for pb in "${protected_arr[@]}"; do
+#            pb_trimmed="$(echo -n "$pb" | xargs)" # trim whitespace
+#            if [ "$branch" = "$pb_trimmed" ]; then
+#              allowed=true
+#              break
+#            fi
+#          done
+#
+#          if [ -n "$USER_VERSION" ]; then
+#            # If user provided a version it is accepted only if branch is protected
+#            if [ "$allowed" = "true" ]; then
+#              echo "Using user-supplied version on protected branch $branch: $USER_VERSION"
+#              echo "version=$USER_VERSION" >> "$GITHUB_OUTPUT"
+#            else
+#              echo "ERROR: A user-supplied version was provided but branch '$branch' is not in protected_branches ('$protected')." >&2
+#              exit 1
+#            fi
+#          else
+#            # no PR and no user version -> fail (explicit)
+#            echo "ERROR: No open PR found and no version input provided. Provide 'version' input when running on non-protected branches." >&2
+#            exit 1
+#          fi
+#        fi
+    - name: Generate version (temp test)
+      id: gen_version
+      shell: bash
+      run: |
+        echo "Generated version: TEMP-0.1.2"
+        echo "version=TEMP-0.1.2" >> "$GITHUB_OUTPUT"

@@ -55,7 +55,7 @@ assert_contains() {
   fi
 }
 
-# Builds "$WORK/<name>/src" with one commit per supplied committer date, then
+# Builds "$WORK/<name>/src" with one commit per supplied commit message, then
 # clones it to "$WORK/<name>/clone" and echoes the clone path.
 make_repo() {
   local name="$1"; shift
@@ -70,17 +70,21 @@ make_repo() {
   # GitHub serves it.
   git -C "$root/src" config uploadpack.allowAnySHA1InWant true
 
-  local i=0 date
-  for date in "$@"; do
+  local i=0 message
+  for message in "$@"; do
     i=$((i + 1))
     printf 'change %s\n' "$i" > "$root/src/file-$i.txt"
     git -C "$root/src" add .
-    GIT_COMMITTER_DATE="$date" GIT_AUTHOR_DATE="$date" \
-      git -C "$root/src" commit -q -m "commit $i"
+    git -C "$root/src" commit -q -m "$message"
   done
 
   git clone -q "$root/src" "$root/clone"
   git -C "$root/clone" config core.hooksPath "$HOOKS"
+  # Cases that add commits do so in the clone, which inherits nothing from src.
+  # Without an identity here those commits fail on a runner that has no global
+  # one configured, and the assertions then read a stale history.
+  git -C "$root/clone" config user.email test@example.com
+  git -C "$root/clone" config user.name "Test"
   printf '%s\n' "$root/clone"
 }
 
@@ -93,8 +97,9 @@ run() {
     cd "$repo" || exit 1
     env -u GITHUB_HEAD_REF -u GITHUB_EVENT_PATH -u INPUT_VERSION \
         GITHUB_EVENT_NAME=push \
-        GITHUB_REF_NAME=main \
+        GITHUB_REF_NAME="$(git rev-parse --abbrev-ref HEAD)" \
         GITHUB_SHA="$(git rev-parse HEAD)" \
+        SEMVER_CMD="bash $STUB" \
         "$@" bash "$SCRIPT"
   ) >"$stdout_file" 2>"$stderr_file"
   status=$?
@@ -105,219 +110,180 @@ run() {
 # Reads one key=value pair out of $out.
 field() { printf '%s\n' "$out" | sed -n "s/^$1=//p"; }
 
-write_pr_event() {
-  local path="$1" sha="$2"
-  printf '{"pull_request":{"number":42,"head":{"sha":"%s"}}}\n' "$sha" > "$path"
-}
+# Stands in for `node next-semver.mjs`. The real thing is exercised by the
+# self-test job in CI; here it is stubbed so the suite stays offline and fast.
+# STUB_VERSION controls what it reports; unset means "nothing to release".
+STUB="$WORK/_next-semver-stub.sh"
+cat > "$STUB" <<'STUBEOF'
+#!/usr/bin/env bash
+if [[ -n "${STUB_VERSION:-}" ]]; then
+  printf '{"version":"%s","type":"%s","lastVersion":null}' \
+    "$STUB_VERSION" "${STUB_TYPE:-minor}" > "$SR_OUT"
+else
+  printf '{"version":null,"type":null,"lastVersion":null}' > "$SR_OUT"
+fi
+STUBEOF
+chmod +x "$STUB"
 
 # --- cases ------------------------------------------------------------------
 
-describe "strips leading zeros from month and day"
-repo="$(make_repo zeros "2026-01-05T04:05:06+00:00")"
-run "$repo"
-assert_eq 0 "$status" "exit code"
-assert_eq "2026.1.5040506" "$(field version)" "version"
-assert_eq "false" "$(field is_prerelease)" "is_prerelease"
-assert_eq "2026-01-05T04:05:06Z" "$(field commit_date)" "commit_date"
-
-describe "keeps hhmmss zero-padded to six digits"
-repo="$(make_repo padded "2026-03-01T00:00:05+00:00")"
-run "$repo"
-assert_eq "2026.3.1000005" "$(field version)" "version"
-
-describe "end of day and end of year"
-repo="$(make_repo edges "2026-12-31T23:59:59+00:00")"
-run "$repo"
-assert_eq "2026.12.31235959" "$(field version)" "version"
-
-describe "converts a non-UTC committer date to UTC"
-# 2026-01-01T00:30:00+02:00 is 2025-12-31T22:30:00 UTC.
-repo="$(make_repo tzshift "2026-01-01T00:30:00+02:00")"
-run "$repo"
-assert_eq "2025.12.31223000" "$(field version)" "version"
-
-describe "day 9 sorts below day 10 under sort -V"
-repo="$(make_repo day9 "2026-10-09T23:59:59+00:00")"
-run "$repo"; v9="$(field version)"
-repo="$(make_repo day10 "2026-10-10T00:00:00+00:00")"
-run "$repo"; v10="$(field version)"
-assert_eq "2026.10.9235959" "$v9" "day 9 version"
-assert_eq "2026.10.10000000" "$v10" "day 10 version"
-assert_eq "$v10" "$(printf '%s\n%s\n' "$v9" "$v10" | sort -V | tail -n 1)" "sort -V picks day 10"
-# The regression plain `sort` would introduce, asserted explicitly.
-assert_eq "$v9" "$(printf '%s\n%s\n' "$v9" "$v10" | sort | tail -n 1)" "plain sort is wrong (documented)"
-
-describe "feature branch gets a -g<sha> prerelease suffix"
-repo="$(make_repo feature "2026-10-29T14:35:07+00:00")"
-run "$repo" GITHUB_REF_NAME=feat/some-work
-assert_eq "false" "$(field is_protected)" "is_protected"
+describe "dev builds append -g<sha> to the version semantic-release reports"
+repo="$(make_repo dev "feat: one")"
+run "$repo" STUB_VERSION=1.4.0
+assert_eq "1.4.0" "$(field base_version)" "base_version"
+assert_match '^1\.4\.0-g[0-9a-f]{7}$' "$(field version)" "version"
 assert_eq "true" "$(field is_prerelease)" "is_prerelease"
-assert_match '^2026\.10\.29143507-g[0-9a-f]{7}$' "$(field version)" "version"
-# The 'g' prefix is what keeps an all-digit short sha a valid semver
-# prerelease identifier, so the suffix must never be bare digits.
-assert_match '-g[0-9a-f]+$' "$(field version)" "prerelease identifier is never all-numeric"
+assert_eq "true" "$(field has_release)" "has_release"
+
+describe "the -g prefix keeps an all-digit short sha valid semver"
+# Without it, a sha like 0123456 is an invalid numeric identifier with a leading zero.
+run "$repo" STUB_VERSION=1.4.0 INPUT_SHA_LENGTH=8
+assert_match '^1\.4\.0-g[0-9a-f]{8}$' "$(field version)" "version with sha_length 8"
 
 describe "sha_length controls the suffix length"
-repo="$(make_repo shalen "2026-10-29T14:35:07+00:00")"
-run "$repo" GITHUB_REF_NAME=feat/x INPUT_SHA_LENGTH=12
-assert_match '^2026\.10\.29143507-g[0-9a-f]{12}$' "$(field version)" "version"
-assert_eq 12 "$(printf '%s' "$(field short_sha)" | wc -c | tr -d ' ')" "short_sha length"
+run "$repo" STUB_VERSION=1.4.0 INPUT_SHA_LENGTH=12
+short="$(field short_sha)"
+assert_eq "12" "${#short}" "short_sha length"
 
-describe "glob patterns match protected branches"
-repo="$(make_repo globs "2026-10-29T14:35:07+00:00")"
-run "$repo" GITHUB_REF_NAME=release/1.x INPUT_PROTECTED_BRANCHES='main
-release/*'
-assert_eq "true" "$(field is_protected)" "is_protected"
-assert_eq "2026.10.29143507" "$(field version)" "version"
-
-describe "a pull request from a protected branch is still a prerelease"
-repo="$(make_repo prprotected "2026-10-29T14:35:07+00:00")"
-head_sha="$(git -C "$repo" rev-parse HEAD)"
-write_pr_event "$WORK/pr-protected.json" "$head_sha"
-run "$repo" GITHUB_EVENT_NAME=pull_request GITHUB_HEAD_REF=main \
-    GITHUB_EVENT_PATH="$WORK/pr-protected.json"
-assert_eq "true" "$(field is_protected)" "is_protected"
-assert_eq "true" "$(field is_prerelease)" "is_prerelease"
-
-describe "a pull request uses head.sha, not the merge GITHUB_SHA"
-# Commit 1 stands in for the PR head, commit 2 for the ephemeral merge commit
-# whose committer date would otherwise leak into the version.
-repo="$(make_repo prhead "2026-02-03T01:02:03+00:00" "2026-07-08T09:10:11+00:00")"
-head_sha="$(git -C "$repo" rev-parse HEAD~1)"
-merge_sha="$(git -C "$repo" rev-parse HEAD)"
-write_pr_event "$WORK/pr-head.json" "$head_sha"
-run "$repo" GITHUB_EVENT_NAME=pull_request GITHUB_HEAD_REF=feat/x \
-    GITHUB_SHA="$merge_sha" GITHUB_EVENT_PATH="$WORK/pr-head.json"
-assert_eq "$head_sha" "$(field commit_sha)" "commit_sha"
-assert_match '^2026\.2\.3010203-g' "$(field version)" "version comes from the head commit"
-
-describe "fetches a PR head commit missing from a shallow clone"
-repo="$(make_repo shallow "2026-02-03T01:02:03+00:00" "2026-07-08T09:10:11+00:00")"
-src="$(dirname "$repo")/src"
-head_sha="$(git -C "$src" rev-parse HEAD~1)"
-shallow="$(dirname "$repo")/shallow"
-git clone -q --depth=1 "file://$src" "$shallow"
-git -C "$shallow" config core.hooksPath "$HOOKS"
-if git -C "$shallow" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
-  bad "fixture invalid: shallow clone already contains $head_sha"
-else
-  ok "shallow clone does not contain the head commit"
-  write_pr_event "$WORK/pr-shallow.json" "$head_sha"
-  run "$shallow" GITHUB_EVENT_NAME=pull_request GITHUB_HEAD_REF=feat/x \
-      GITHUB_EVENT_PATH="$WORK/pr-shallow.json"
-  assert_eq 0 "$status" "exit code"
-  assert_eq "$head_sha" "$(field commit_sha)" "commit_sha after fetch"
-  assert_match '^2026\.2\.3010203-g' "$(field version)" "version"
-fi
-
-describe "an existing tag at the same commit is idempotent"
-repo="$(make_repo idempotent "2026-10-29T14:35:07+00:00")"
-src="$(dirname "$repo")/src"
-git -C "$src" tag -a v2026.10.29143507 -m "release"
+describe "no releasable commit still yields a buildable version"
+repo="$(make_repo norelease "feat: one")"
+git -C "$repo" tag v1.4.0
 run "$repo"
-assert_eq 0 "$status" "exit code"
-assert_eq "true" "$(field tag_exists)" "tag_exists"
-assert_eq "2026.10.29143507" "$(field version)" "version"
+assert_eq "false" "$(field has_release)" "has_release"
+assert_eq "1.4.1" "$(field base_version)" "base_version falls back to a patch bump"
+assert_match '^1\.4\.1-g[0-9a-f]{7}$' "$(field version)" "version"
 
-describe "an existing tag at a different commit is a hard failure"
-repo="$(make_repo collision "2026-10-29T14:35:07+00:00" "2026-11-30T01:02:03+00:00")"
-src="$(dirname "$repo")/src"
-# Tag the newer commit with the version the older commit will compute.
-git -C "$src" tag -a v2026.10.29143507 -m "squatter" HEAD
-git -C "$repo" fetch -q --tags
-run "$repo" GITHUB_SHA="$(git -C "$repo" rev-parse HEAD~1)"
-assert_eq 1 "$status" "exit code"
-assert_contains "Version collision" "$err" "stderr"
+describe "a release branch derives its base from the branch name, not commits"
+repo="$(make_repo relbranch "feat: one")"
+git -C "$repo" checkout -q -b release/1.4
+# STUB_VERSION is deliberately wrong: the release path must not consult it.
+run "$repo" INPUT_CHANNEL=rc STUB_VERSION=9.9.9
+assert_eq "1.4.0" "$(field base_version)" "base_version"
+assert_eq "1.4.0-rc.1" "$(field version)" "version"
+assert_eq "1" "$(field rc_number)" "rc_number"
 
-describe "a lightweight tag is detected too"
-repo="$(make_repo lightweight "2026-10-29T14:35:07+00:00")"
-src="$(dirname "$repo")/src"
-git -C "$src" tag v2026.10.29143507
-run "$repo"
-assert_eq 0 "$status" "exit code"
+describe "rc numbers increment within a base version"
+git -C "$repo" tag v1.4.0-rc.1
+printf 'more\n' > "$repo/more.txt"
+git -C "$repo" add . && git -C "$repo" commit -q -m "fix: two"
+run "$repo" INPUT_CHANNEL=rc
+assert_eq "1.4.0-rc.2" "$(field version)" "version"
+assert_eq "false" "$(field tag_exists)" "tag_exists"
+
+describe "re-cutting an rc on the same commit reuses it"
+git -C "$repo" tag v1.4.0-rc.2
+run "$repo" INPUT_CHANNEL=rc
+assert_eq "1.4.0-rc.2" "$(field version)" "version"
 assert_eq "true" "$(field tag_exists)" "tag_exists"
 
-describe "a version older than the latest release warns by default"
-repo="$(make_repo monotonic "2026-10-29T14:35:07+00:00")"
-src="$(dirname "$repo")/src"
-git -C "$src" tag -a v2026.12.1000000 -m "newer release"
-run "$repo"
-assert_eq 0 "$status" "exit code"
-assert_contains "::warning::" "$err" "stderr"
-assert_contains "older than the latest released version" "$err" "stderr"
+describe "after a final release the series moves to the next patch"
+git -C "$repo" tag v1.4.0
+printf 'hotfix\n' > "$repo/hotfix.txt"
+git -C "$repo" add . && git -C "$repo" commit -q -m "fix: three"
+run "$repo" INPUT_CHANNEL=rc
+assert_eq "1.4.1" "$(field base_version)" "base_version"
+assert_eq "1.4.1-rc.1" "$(field version)" "version"
 
-describe "non_monotonic=fail turns that warning into an error"
-run "$repo" INPUT_NON_MONOTONIC=fail
-assert_eq 1 "$status" "exit code"
-assert_contains "::error::" "$err" "stderr"
+describe "dev builds on a release branch use the same base, with -g<sha>"
+run "$repo" INPUT_CHANNEL=dev STUB_VERSION=9.9.9
+assert_eq "1.4.1" "$(field base_version)" "base_version ignores semantic-release"
+assert_match '^1\.4\.1-g[0-9a-f]{7}$' "$(field version)" "version"
 
-describe "non_monotonic=ignore stays silent"
-run "$repo" INPUT_NON_MONOTONIC=ignore
-assert_eq 0 "$status" "exit code"
-if [[ "$err" == *"older than the latest"* ]]; then
-  bad "stderr should not mention monotonicity: $err"
-else
-  ok "stderr is quiet about monotonicity"
-fi
+describe "tags on unrelated branches do not raise the base"
+repo="$(make_repo unrelated "feat: one")"
+git -C "$repo" checkout -q -b other
+printf 'o\n' > "$repo/o.txt"; git -C "$repo" add . && git -C "$repo" commit -q -m "feat: other"
+git -C "$repo" tag v1.4.7
+git -C "$repo" checkout -q -b release/1.4 main
+run "$repo" INPUT_CHANNEL=rc
+assert_eq "1.4.0" "$(field base_version)" "base_version ignores v1.4.7 on 'other'"
 
-describe "monotonicity ignores tags that are not CalVer"
-repo="$(make_repo mixedtags "2026-10-29T14:35:07+00:00")"
-src="$(dirname "$repo")/src"
-git -C "$src" tag -a v9.9.9 -m "old semver scheme"
-git -C "$src" tag -a not-a-version -m "noise"
-run "$repo"
-assert_eq 0 "$status" "exit code"
-if [[ "$err" == *"older than the latest"* ]]; then
-  bad "non-CalVer tags should be skipped: $err"
-else
-  ok "non-CalVer tags are skipped"
-fi
+describe "promotion strips -rc.N and verifies the tag exists"
+repo="$(make_repo promote "feat: one")"
+git -C "$repo" checkout -q -b release/2.0
+git -C "$repo" tag v2.0.0-rc.3
+run "$repo" INPUT_CHANNEL=release INPUT_PROMOTE_FROM=v2.0.0-rc.3
+assert_eq "2.0.0" "$(field version)" "version"
+assert_eq "3" "$(field rc_number)" "rc_number"
+assert_eq "false" "$(field is_prerelease)" "is_prerelease"
+assert_eq "false" "$(field tag_exists)" "tag_exists"
+
+describe "promoting an already-promoted rc is a no-op, not a failure"
+git -C "$repo" tag v2.0.0
+run "$repo" INPUT_CHANNEL=release INPUT_PROMOTE_FROM=v2.0.0-rc.3
+assert_eq "0" "$status" "exit status"
+assert_eq "true" "$(field tag_exists)" "tag_exists"
+
+describe "promoting a tag that does not exist fails loudly"
+run "$repo" INPUT_CHANNEL=release INPUT_PROMOTE_FROM=v2.0.0-rc.9
+assert_eq "1" "$status" "exit status"
+assert_contains "does not exist" "$err" "error"
+
+describe "promotion works on a detached HEAD"
+# promote.yml checks the rc tag out directly, so HEAD is detached and the branch
+# name is the tag. Nothing may fall through to commit analysis on that path.
+repo="$(make_repo detached "feat: one")"
+git -C "$repo" checkout -q -b release/2.0
+git -C "$repo" tag v2.0.0-rc.1
+git -C "$repo" checkout -q v2.0.0-rc.1
+run "$repo" INPUT_CHANNEL=release INPUT_PROMOTE_FROM=v2.0.0-rc.1 GITHUB_REF_NAME=v2.0.0-rc.1
+assert_eq "0" "$status" "exit status"
+assert_eq "2.0.0" "$(field version)" "version"
+assert_eq "false" "$(field is_prerelease)" "is_prerelease"
+
+describe "a release branch owns its line, so trunk skips past it"
+repo="$(make_repo floor "feat: one")"
+git -C "$repo" branch release/1.4
+git -C "$repo" push -q origin release/1.4
+run "$repo" STUB_VERSION=1.4.0
+assert_eq "1.5.0" "$(field base_version)" "base_version raised above the cut series"
+
+describe "the floor never lowers a version that is already higher"
+run "$repo" STUB_VERSION=2.0.0
+assert_eq "2.0.0" "$(field base_version)" "base_version"
+
+describe "a malformed release branch name is rejected"
+repo="$(make_repo badbranch "feat: one")"
+git -C "$repo" checkout -q -b release/nonsense
+run "$repo" INPUT_CHANNEL=rc
+assert_eq "1" "$status" "exit status"
+assert_contains "release/<major>.<minor>" "$err" "error"
+
+describe "rc outside a release branch is rejected"
+repo="$(make_repo rcoffbranch "feat: one")"
+run "$repo" INPUT_CHANNEL=rc
+assert_eq "1" "$status" "exit status"
+assert_contains "must run on a release/" "$err" "error"
 
 describe "tag_prefix is configurable"
-repo="$(make_repo prefix "2026-10-29T14:35:07+00:00")"
-run "$repo" INPUT_TAG_PREFIX=""
-assert_eq "2026.10.29143507" "$(field tag)" "tag without prefix"
-run "$repo" INPUT_TAG_PREFIX="release-"
-assert_eq "release-2026.10.29143507" "$(field tag)" "tag with custom prefix"
+repo="$(make_repo prefix "feat: one")"
+git -C "$repo" checkout -q -b release/3.1
+git -C "$repo" tag 3.1.0-rc.1
+printf 'next\n' > "$repo/next.txt"
+git -C "$repo" add . && git -C "$repo" commit -q -m "fix: next"
+run "$repo" INPUT_CHANNEL=rc INPUT_TAG_PREFIX=
+assert_eq "3.1.0-rc.2" "$(field version)" "version"
+assert_eq "3.1.0-rc.2" "$(field tag)" "tag has no prefix"
 
 describe "an explicit version override wins"
-repo="$(make_repo override "2026-10-29T14:35:07+00:00")"
-run "$repo" INPUT_VERSION=1.2.3
-assert_eq "1.2.3" "$(field version)" "version"
-assert_eq "v1.2.3" "$(field tag)" "tag"
+repo="$(make_repo override "feat: one")"
+run "$repo" STUB_VERSION=1.4.0 INPUT_VERSION=9.9.9
+assert_eq "9.9.9" "$(field version)" "version"
 assert_eq "false" "$(field is_prerelease)" "is_prerelease"
-run "$repo" INPUT_VERSION=1.2.3-rc.1
-assert_eq "true" "$(field is_prerelease)" "is_prerelease for a prerelease override"
 
 describe "invalid configuration is rejected"
-repo="$(make_repo badconfig "2026-10-29T14:35:07+00:00")"
-run "$repo" INPUT_SHA_LENGTH=abc
-assert_eq 1 "$status" "sha_length=abc exit code"
-assert_contains "sha_length must be a number" "$err" "stderr"
-run "$repo" INPUT_SHA_LENGTH=2
-assert_eq 1 "$status" "sha_length=2 exit code"
-run "$repo" INPUT_NON_MONOTONIC=maybe
-assert_eq 1 "$status" "non_monotonic=maybe exit code"
-assert_contains "non_monotonic must be one of" "$err" "stderr"
+run "$repo" INPUT_CHANNEL=nonsense
+assert_eq "1" "$status" "exit status for a bad channel"
+run "$repo" STUB_VERSION=1.4.0 INPUT_SHA_LENGTH=2
+assert_eq "1" "$status" "exit status for a short sha_length"
 
 describe "every computed version is valid semver"
-repo="$(make_repo semver "2026-01-05T04:05:06+00:00")"
-semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
-run "$repo"
-assert_match "$semver_re" "$(field version)" "release version"
-run "$repo" GITHUB_REF_NAME=feat/x
-assert_match "$semver_re" "$(field version)" "prerelease version"
-
-describe "the third component stays below Int32"
-# Day 31 at 23:59:59 is the largest possible value: 31235959 < 2147483647.
-repo="$(make_repo int32 "2026-12-31T23:59:59+00:00")"
-run "$repo"
-patch="$(field version)"; patch="${patch##*.}"
-if (( patch < 2147483647 )); then
-  ok "patch $patch fits in Int32"
-else
-  bad "patch $patch exceeds Int32"
-fi
+repo="$(make_repo semver "feat: one")"
+run "$repo" STUB_VERSION=1.4.0
+assert_match '^[0-9]+\.[0-9]+\.[0-9]+-g[0-9a-f]+$' "$(field version)" "dev version"
+git -C "$repo" checkout -q -b release/1.4
+run "$repo" INPUT_CHANNEL=rc
+assert_match '^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$' "$(field version)" "rc version"
 
 # --- summary ----------------------------------------------------------------
 

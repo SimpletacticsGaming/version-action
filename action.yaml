@@ -1,106 +1,87 @@
-name: 'Version generator'
+name: 'CalVer version generator'
 description: |
-  Generates a version string.
-  • On the main (or any protected) branch it returns the user provided input
-  • On a pull-request pipeline it returns 0.<PR>#.<RUN_ID>
+  Computes a CalVer version from the commit's committer date in UTC.
+  • On a protected branch: yyyy.m.dhhmmss (e.g. 2026.10.29143507)
+  • Everywhere else: the same version with a -g<short-sha> prerelease suffix
 author: 'mohjohfox <marcofuchs@mohjohfox.de>'
 
+branding:
+  icon: 'tag'
+  color: 'blue'
+
 inputs:
-  version:
-    description: "Optional version input to use when no PR is open (e.g. 1.2.3)."
-    required: false
   protected_branches:
-    description: "Comma-separated list of branches where a manual version is allowed. Defaults to 'main,master'."
+    description: |
+      Branches that receive a bare release version, comma- or newline-separated.
+      Glob patterns are supported, e.g. "main,release/*".
     required: false
     default: "main,master"
+  tag_prefix:
+    description: "Prefix for the `tag` output. Set to an empty string for bare tags."
+    required: false
+    default: "v"
+  sha_length:
+    description: "Number of short-sha characters in the prerelease suffix (4-40)."
+    required: false
+    default: "7"
+  non_monotonic:
+    description: |
+      What to do when the computed version is older than the latest existing
+      release tag: "warn" (default), "fail", or "ignore".
+    required: false
+    default: "warn"
+  version:
+    description: |
+      Explicit version override. When set, the computed CalVer value is
+      discarded and this string is used verbatim.
+    required: false
+    default: ""
+  remote:
+    description: "Git remote used for tag lookups and fetching missing commits."
+    required: false
+    default: "origin"
 
 outputs:
   version:
-    description: "The computed version string (either the user input or the auto-generated PR version)."
+    description: "The computed version, e.g. 2026.10.29143507 or 2026.10.29143507-g1a2b3c4."
     value: ${{ steps.version.outputs.version }}
+  tag:
+    description: "The version prefixed with `tag_prefix`, e.g. v2026.10.29143507."
+    value: ${{ steps.version.outputs.tag }}
+  is_prerelease:
+    description: "'true' when the version carries a prerelease suffix."
+    value: ${{ steps.version.outputs.is_prerelease }}
+  is_protected:
+    description: "'true' when the branch matches `protected_branches`."
+    value: ${{ steps.version.outputs.is_protected }}
+  tag_exists:
+    description: "'true' when `tag` already exists on the remote at this exact commit."
+    value: ${{ steps.version.outputs.tag_exists }}
+  commit_sha:
+    description: "Full sha of the commit the version was derived from."
+    value: ${{ steps.version.outputs.commit_sha }}
+  short_sha:
+    description: "Truncated sha used in the prerelease suffix."
+    value: ${{ steps.version.outputs.short_sha }}
+  commit_date:
+    description: "Committer date of that commit, ISO-8601 in UTC."
+    value: ${{ steps.version.outputs.commit_date }}
+  branch:
+    description: "Branch the version was computed for."
+    value: ${{ steps.version.outputs.branch }}
 
 runs:
   using: 'composite'
   steps:
-    - name: Detect context
-      id: ctx
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
-        event="${GITHUB_EVENT_NAME}"
-        pr_open="false"
-        pr_number="$(gh pr list --limit 1 --head "$branch" --state open --json number --jq '.[0].number')"
-
-        if [[ "$pr_number" ]]; then
-            pr_open="true"
-            echo "Detected pull request #${pr_number} (branch: ${branch})."
-        elif [[ "$event" == pull_request* ]]; then
-          if command -v jq >/dev/null 2>&1; then
-            pr_number="$(jq -r '.pull_request.number // empty' "${GITHUB_EVENT_PATH}")"
-          fi
-
-          if [[ -z "$pr_number" && "$GITHUB_REF" =~ refs/pull/([0-9]+)/ ]]; then
-            pr_number="${BASH_REMATCH[1]}"
-          fi
-
-          if [[ -z "$pr_number" ]]; then
-            echo "Unable to determine pull request number." >&2
-            exit 1
-          fi
-          pr_open="true"
-          echo "Detected pull request #${pr_number} (branch: ${branch})."
-        fi
-        
-        {
-          echo "branch=$branch"
-          echo "event_name=$event"
-          echo "pr_open=$pr_open"
-          echo "pr_number=$pr_number"
-        } >> "$GITHUB_OUTPUT"
-
     - name: Compute version
       id: version
       shell: bash
       env:
-        USER_VERSION: ${{ inputs.version }}
-        PROTECTED_BRANCHES: ${{ inputs.protected_branches }}
-        RUN_ID: ${{ github.run_id }}
-        IS_PR: ${{ steps.ctx.outputs.pr_open }}
-        PR_NUM: ${{ steps.ctx.outputs.pr_number }}
-        BRANCH_NAME: ${{ steps.ctx.outputs.branch }}
+        INPUT_PROTECTED_BRANCHES: ${{ inputs.protected_branches }}
+        INPUT_TAG_PREFIX: ${{ inputs.tag_prefix }}
+        INPUT_SHA_LENGTH: ${{ inputs.sha_length }}
+        INPUT_NON_MONOTONIC: ${{ inputs.non_monotonic }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_REMOTE: ${{ inputs.remote }}
       run: |
-        set -euo pipefail
-
-        IFS=',' read -r -a protected_arr <<< "$PROTECTED_BRANCHES"
-
-        if [[ "$IS_PR" == "true" ]]; then
-          VERSION="0.${PR_NUM}.${RUN_ID}"
-          echo "Running in PR context. Generated version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
-        # Non-PR context: require a user-supplied version on allowed branches.
-        allowed="false"
-        for pb in "${protected_arr[@]}"; do
-          pb_trimmed="$(echo -n "$pb" | xargs)"
-          if [[ "$BRANCH_NAME" == "$pb_trimmed" ]]; then
-            allowed="true"
-            break
-          fi
-        done
-
-        if [[ -z "$USER_VERSION" ]]; then
-          echo "ERROR: No open PR detected and no version input provided. Supply 'version' input when running on non-PR events." >&2
-          exit 1
-        fi
-
-        if [[ "$allowed" != "true" ]]; then
-          echo "ERROR: A user-supplied version was provided but branch '$BRANCH_NAME' is not in protected_branches ('$PROTECTED_BRANCHES')." >&2
-          exit 1
-        fi
-
-        echo "Using user-supplied version '$USER_VERSION' on protected branch '$BRANCH_NAME'."
-        echo "version=$USER_VERSION" >> "$GITHUB_OUTPUT"
+        "$GITHUB_ACTION_PATH/scripts/compute-version.sh" >> "$GITHUB_OUTPUT"

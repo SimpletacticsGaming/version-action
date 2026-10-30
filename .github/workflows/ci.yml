@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: shellcheck --severity=style scripts/*.sh tests/*.sh
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: bash tests/compute-version.test.sh
+
+  self-test:
+    name: Self test (${{ github.event_name }})
+    runs-on: ubuntu-latest
+    steps:
+      # Deliberately left at the default fetch-depth of 1 so the shallow-clone
+      # fetch-by-sha path is exercised on pull_request events.
+      - uses: actions/checkout@v4
+
+      - id: version
+        uses: ./
+
+      - name: Assert outputs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          IS_PRERELEASE: ${{ steps.version.outputs.is_prerelease }}
+          COMMIT_SHA: ${{ steps.version.outputs.commit_sha }}
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$*"; exit 1; }
+
+          echo "version=$VERSION tag=$TAG is_prerelease=$IS_PRERELEASE"
+
+          [[ -n "$VERSION" ]] || fail "version output is empty"
+          [[ "$TAG" == "v$VERSION" ]] || fail "tag '$TAG' is not 'v$VERSION'"
+
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            [[ "$IS_PRERELEASE" == "true" ]] || fail "expected a prerelease on a pull request"
+            [[ "$VERSION" =~ ^[0-9]{4}\.[1-9][0-9]?\.[1-9][0-9]{6,7}-g[0-9a-f]{7}$ ]] \
+              || fail "'$VERSION' is not yyyy.m.dhhmmss-g<sha>"
+            # The version must describe the PR head, never the ephemeral
+            # refs/pull/N/merge commit that GITHUB_SHA points at.
+            [[ "$COMMIT_SHA" == "$HEAD_SHA" ]] \
+              || fail "commit_sha '$COMMIT_SHA' is not the PR head '$HEAD_SHA'"
+            [[ "$VERSION" == *"-g${SHORT_SHA}" ]] \
+              || fail "'$VERSION' does not end in the short sha '$SHORT_SHA'"
+          else
+            [[ "$IS_PRERELEASE" == "false" ]] || fail "expected a release on ${{ github.ref_name }}"
+            [[ "$VERSION" =~ ^[0-9]{4}\.[1-9][0-9]?\.[1-9][0-9]{6,7}$ ]] \
+              || fail "'$VERSION' is not yyyy.m.dhhmmss"
+          fi
+
+      - name: Assert the version is reproducible
+        id: again
+        uses: ./
+
+      - name: Compare both runs
+        env:
+          FIRST: ${{ steps.version.outputs.version }}
+          SECOND: ${{ steps.again.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$FIRST" == "$SECOND" ]] \
+            || { echo "::error::version is not deterministic: '$FIRST' then '$SECOND'"; exit 1; }
+          echo "Both runs produced $FIRST"
+
+      - name: Assert a feature branch gets a suffix
+        id: feature
+        uses: ./
+        with:
+          protected_branches: "some-branch-that-does-not-exist"
+
+      - name: Check the suffix
+        env:
+          VERSION: ${{ steps.feature.outputs.version }}
+          IS_PROTECTED: ${{ steps.feature.outputs.is_protected }}
+        run: |
+          set -euo pipefail
+          [[ "$IS_PROTECTED" == "false" ]] || { echo "::error::expected is_protected=false"; exit 1; }
+          [[ "$VERSION" == *-g* ]] || { echo "::error::'$VERSION' has no -g suffix"; exit 1; }
+          echo "Unprotected ref produced $VERSION"
+
+  release:
+    name: Release
+    # Only a direct push to main releases, and only once every check is green.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [shellcheck, test, self-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      # Queue rather than cancel: a cancelled run could leave the tag pushed
+      # and the release missing.
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dogfooding: the action computes the version it is released under.
+      - id: version
+        uses: ./
+
+      - name: Create the release
+        if: steps.version.outputs.is_prerelease == 'false' && steps.version.outputs.tag_exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT_SHA: ${{ steps.version.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --target "$COMMIT_SHA" \
+            --title "$VERSION" \
+            --generate-notes
+          echo "Released [\`$TAG\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG)" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Already released
+        if: steps.version.outputs.tag_exists == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          echo "\`$TAG\` already points at this commit; nothing to release." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Move the v1 pointer
+        if: steps.version.outputs.is_prerelease == 'false'
+        env:
+          COMMIT_SHA: ${{ steps.version.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          # Consumers pin `@v1`; the immutable tag above is the audit trail.
+          # Re-pushing the same sha is a no-op, so a re-run repairs the
+          # pointer instead of failing.
+          git tag -f v1 "$COMMIT_SHA"
+          git push --force origin refs/tags/v1

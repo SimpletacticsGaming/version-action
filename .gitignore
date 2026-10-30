@@ -8,3 +8,6 @@
 # Datasource local storage ignored files
 /dataSources/
 /dataSources.local.xml
+
+# Installed by the action at runtime from package-lock.json; never committed.
+/node_modules/

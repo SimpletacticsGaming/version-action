@@ -1,8 +1,9 @@
-name: 'CalVer version generator'
+name: 'Semantic version generator'
 description: |
-  Computes a CalVer version from the commit's committer date in UTC.
-  • On a protected branch: yyyy.m.dhhmmss (e.g. 2026.10.29143507)
-  • Everywhere else: the same version with a -g<short-sha> prerelease suffix
+  Computes a semantic version for the commit being built.
+  • channel: dev      X.Y.Z-g<sha>, from Conventional Commit messages
+  • channel: rc       X.Y.Z-rc.N,   cut from a release/X.Y branch
+  • channel: release  X.Y.Z,        promotion of an existing rc
 author: 'mohjohfox <marcofuchs@mohjohfox.de>'
 
 branding:
@@ -10,58 +11,68 @@ branding:
   color: 'blue'
 
 inputs:
-  protected_branches:
+  channel:
     description: |
-      Branches that receive a bare release version, comma- or newline-separated.
-      Glob patterns are supported, e.g. "main,release/*".
+      Which kind of version to compute: "dev" (default), "rc" or "release".
+      "rc" must run on a release/<major>.<minor> branch; "release" needs promote_from.
     required: false
-    default: "main,master"
+    default: "dev"
+  promote_from:
+    description: "For channel 'release': the <prefix><version>-rc.<n> tag being promoted."
+    required: false
+    default: ""
   tag_prefix:
     description: "Prefix for the `tag` output. Set to an empty string for bare tags."
     required: false
     default: "v"
   sha_length:
-    description: "Number of short-sha characters in the prerelease suffix (4-40)."
+    description: "Number of short-sha characters in the dev suffix (4-40)."
     required: false
     default: "7"
-  non_monotonic:
-    description: |
-      What to do when the computed version is older than the latest existing
-      release tag: "warn" (default), "fail", or "ignore".
-    required: false
-    default: "warn"
   version:
-    description: |
-      Explicit version override. When set, the computed CalVer value is
-      discarded and this string is used verbatim.
+    description: "Explicit version override. When set, the computed value is discarded."
     required: false
     default: ""
   remote:
-    description: "Git remote used for tag lookups and fetching missing commits."
+    description: "Git remote consulted for existing release branches."
     required: false
     default: "origin"
 
 outputs:
   version:
-    description: "The computed version, e.g. 2026.10.29143507 or 2026.10.29143507-g1a2b3c4."
+    description: "The computed version, e.g. 1.4.0-g1a2b3c4, 1.4.0-rc.2 or 1.4.0."
     value: ${{ steps.version.outputs.version }}
+  base_version:
+    description: "The bare X.Y.Z the version is built from."
+    value: ${{ steps.version.outputs.base_version }}
   tag:
-    description: "The version prefixed with `tag_prefix`, e.g. v2026.10.29143507."
+    description: "The version prefixed with `tag_prefix`, e.g. v1.4.0-rc.2."
     value: ${{ steps.version.outputs.tag }}
+  rc_number:
+    description: "The release-candidate number, for the rc and release channels."
+    value: ${{ steps.version.outputs.rc_number }}
   is_prerelease:
-    description: "'true' when the version carries a prerelease suffix."
+    description: "'true' unless this is the release channel."
     value: ${{ steps.version.outputs.is_prerelease }}
-  is_protected:
-    description: "'true' when the branch matches `protected_branches`."
-    value: ${{ steps.version.outputs.is_protected }}
+  has_release:
+    description: |
+      'false' when no commit since the last release was releasable. A version is
+      still produced so the build can proceed; it just should not be tagged.
+    value: ${{ steps.version.outputs.has_release }}
+  release_type:
+    description: "'major', 'minor' or 'patch' on the dev channel; empty otherwise."
+    value: ${{ steps.version.outputs.release_type }}
+  last_version:
+    description: "The release this version follows, if there is one."
+    value: ${{ steps.version.outputs.last_version }}
   tag_exists:
-    description: "'true' when `tag` already exists on the remote at this exact commit."
+    description: "'true' when `tag` already exists, making the run a no-op."
     value: ${{ steps.version.outputs.tag_exists }}
   commit_sha:
     description: "Full sha of the commit the version was derived from."
     value: ${{ steps.version.outputs.commit_sha }}
   short_sha:
-    description: "Truncated sha used in the prerelease suffix."
+    description: "Truncated sha used in the dev suffix."
     value: ${{ steps.version.outputs.short_sha }}
   commit_date:
     description: "Committer date of that commit, ISO-8601 in UTC."
@@ -73,14 +84,31 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # Only the dev channel reads commit messages; rc and release derive everything
+    # from refs, so they stay pure bash and skip the Node setup entirely.
+    - name: Set up Node
+      if: inputs.channel == 'dev'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        # Deliberately uncached: setup-node hashes the lockfile with
+        # @actions/glob, which ignores any path outside GITHUB_WORKSPACE, and the
+        # action's own lockfile lives under the runner's _actions directory when
+        # this action is consumed from another repository.
+
+    - name: Install version analysis dependencies
+      if: inputs.channel == 'dev'
+      shell: bash
+      run: npm ci --omit=dev --no-audit --no-fund --prefix "$GITHUB_ACTION_PATH"
+
     - name: Compute version
       id: version
       shell: bash
       env:
-        INPUT_PROTECTED_BRANCHES: ${{ inputs.protected_branches }}
+        INPUT_CHANNEL: ${{ inputs.channel }}
+        INPUT_PROMOTE_FROM: ${{ inputs.promote_from }}
         INPUT_TAG_PREFIX: ${{ inputs.tag_prefix }}
         INPUT_SHA_LENGTH: ${{ inputs.sha_length }}
-        INPUT_NON_MONOTONIC: ${{ inputs.non_monotonic }}
         INPUT_VERSION: ${{ inputs.version }}
         INPUT_REMOTE: ${{ inputs.remote }}
       run: |
